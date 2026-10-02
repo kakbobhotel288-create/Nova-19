@@ -1,0 +1,1198 @@
+# ================================================================
+# NOVA V19 — POCKET OPTION DEMO TRACKER
+# LIVE CLOCK + AUTOMATIC 5-MINUTE CANDLE DETECTION
+# ================================================================
+
+!pip -q install yfinance scikit-learn
+
+import os
+import time
+import warnings
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+from IPython.display import clear_output
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
+warnings.filterwarnings("ignore")
+
+# ================================================================
+# CONFIG
+# ================================================================
+
+TICKER = "EURUSD=X"
+INTERVAL = "5m"
+PERIOD = "60d"
+
+SIGNAL_THRESHOLD = 0.60
+PAYOUT = 0.92
+EXPIRY_BARS = 1
+
+TRAIN_HOLDOUT = 0.15
+
+REFRESH_SECONDS = 5
+
+TRADE_LOG_FILE = "nova_v19_demo_trades.csv"
+SIGNAL_LOG_FILE = "nova_v19_demo_signals.csv"
+
+# Utah / Mountain Time
+LOCAL_TZ = ZoneInfo("America/Denver")
+
+# ================================================================
+# HEADER
+# ================================================================
+
+print("=" * 72)
+print("NOVA V19 — POCKET OPTION DEMO TRACKER")
+print("=" * 72)
+print("Asset:        EUR/USD")
+print("Timeframe:    5 minutes")
+print("Expiry:       5 minutes")
+print("Threshold:    0.60")
+print("Execution:    MANUAL DEMO ONLY")
+print("=" * 72)
+
+
+# ================================================================
+# DATA DOWNLOAD
+# ================================================================
+
+def download_data():
+
+    raw = yf.download(
+        TICKER,
+        interval=INTERVAL,
+        period=PERIOD,
+        auto_adjust=False,
+        progress=False,
+        threads=False
+    )
+
+    if raw is None or len(raw) == 0:
+        raise RuntimeError("Yahoo Finance returned no data.")
+
+    # Handle MultiIndex columns
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = [
+            c[0] if isinstance(c, tuple) else c
+            for c in raw.columns
+        ]
+
+    raw.columns = [str(c).lower() for c in raw.columns]
+
+    # Remove duplicate columns
+    raw = raw.loc[:, ~raw.columns.duplicated()]
+
+    required = ["open", "high", "low", "close"]
+
+    missing = [c for c in required if c not in raw.columns]
+
+    if missing:
+        raise KeyError(
+            f"Missing required columns: {missing}\n"
+            f"Available columns: {list(raw.columns)}"
+        )
+
+    data = raw[required].copy()
+
+    # Numeric conversion
+    for c in required:
+        data[c] = pd.to_numeric(data[c], errors="coerce")
+
+    data = data.dropna()
+
+    # UTC timestamps
+    if data.index.tz is None:
+        data.index = data.index.tz_localize("UTC")
+    else:
+        data.index = data.index.tz_convert("UTC")
+
+    data = data.sort_index()
+    data = data[~data.index.duplicated(keep="last")]
+
+    return data
+
+
+# ================================================================
+# FEATURE ENGINEERING
+# ================================================================
+
+def build_features(df):
+
+    x = df.copy()
+
+    close = x["close"]
+    open_ = x["open"]
+    high = x["high"]
+    low = x["low"]
+
+    eps = 1e-12
+
+    # ------------------------------------------------------------
+    # RETURNS
+    # ------------------------------------------------------------
+
+    x["ret_1"] = close.pct_change(1)
+    x["ret_2"] = close.pct_change(2)
+    x["ret_3"] = close.pct_change(3)
+    x["ret_6"] = close.pct_change(6)
+    x["ret_12"] = close.pct_change(12)
+    x["ret_24"] = close.pct_change(24)
+    x["ret_48"] = close.pct_change(48)
+
+    # ------------------------------------------------------------
+    # CANDLE STRUCTURE
+    # ------------------------------------------------------------
+
+    candle_range = (high - low).replace(0, np.nan)
+
+    body = close - open_
+
+    x["body_ratio"] = body.abs() / (candle_range + eps)
+    x["signed_body"] = body / (candle_range + eps)
+
+    x["upper_wick_ratio"] = (
+        high - np.maximum(open_, close)
+    ) / (candle_range + eps)
+
+    x["lower_wick_ratio"] = (
+        np.minimum(open_, close) - low
+    ) / (candle_range + eps)
+
+    # ------------------------------------------------------------
+    # ATR
+    # ------------------------------------------------------------
+
+    prev_close = close.shift(1)
+
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+
+    true_range = pd.concat(
+        [tr1, tr2, tr3],
+        axis=1
+    ).max(axis=1)
+
+    atr = true_range.rolling(14).mean()
+
+    x["atr_ratio"] = atr / (close + eps)
+
+    # ------------------------------------------------------------
+    # EMAs
+    # ------------------------------------------------------------
+
+    ema9 = close.ewm(span=9, adjust=False).mean()
+    ema21 = close.ewm(span=21, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
+
+    x["ema9_dist"] = (close - ema9) / (close + eps)
+    x["ema21_dist"] = (close - ema21) / (close + eps)
+    x["ema50_dist"] = (close - ema50) / (close + eps)
+
+    x["ema9_slope"] = ema9.pct_change(3)
+    x["ema21_slope"] = ema21.pct_change(3)
+    x["ema50_slope"] = ema50.pct_change(3)
+
+    x["trend_strength"] = (
+        (ema9 - ema21) +
+        (ema21 - ema50)
+    ) / (close + eps)
+
+    # ------------------------------------------------------------
+    # RSI
+    # ------------------------------------------------------------
+
+    delta = close.diff()
+
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
+
+    rs = avg_gain / (avg_loss + eps)
+
+    rsi = 100 - (100 / (1 + rs))
+
+    x["rsi"] = rsi
+    x["rsi_centered"] = (rsi - 50) / 50
+
+    # ------------------------------------------------------------
+    # MOMENTUM
+    # ------------------------------------------------------------
+
+    x["momentum_3"] = close.pct_change(3)
+    x["momentum_6"] = close.pct_change(6)
+    x["momentum_12"] = close.pct_change(12)
+
+    # ------------------------------------------------------------
+    # RANGE POSITION
+    # ------------------------------------------------------------
+
+    for n in [6, 12, 24, 48]:
+
+        rolling_high = high.rolling(n).max()
+        rolling_low = low.rolling(n).min()
+
+        x[f"range_pos_{n}"] = (
+            (close - rolling_low) /
+            (rolling_high - rolling_low + eps)
+        )
+
+    # ------------------------------------------------------------
+    # TIME FEATURES
+    # ------------------------------------------------------------
+
+    hour = x.index.hour
+
+    x["hour_sin"] = np.sin(
+        2 * np.pi * hour / 24
+    )
+
+    x["hour_cos"] = np.cos(
+        2 * np.pi * hour / 24
+    )
+
+    # ------------------------------------------------------------
+    # SESSION FEATURES
+    # UTC
+    # ------------------------------------------------------------
+
+    x["session_asia"] = (
+        ((hour >= 0) & (hour < 8)).astype(int)
+    )
+
+    x["session_europe"] = (
+        ((hour >= 7) & (hour < 16)).astype(int)
+    )
+
+    x["session_newyork"] = (
+        ((hour >= 13) & (hour < 21)).astype(int)
+    )
+
+    x["session_evening"] = (
+        ((hour >= 21) | (hour < 1)).astype(int)
+    )
+
+    return x
+
+
+# ================================================================
+# V19 FEATURE LIST
+# ================================================================
+
+FEATURES = [
+    "ret_1",
+    "ret_2",
+    "ret_3",
+    "ret_6",
+    "ret_12",
+    "ret_24",
+    "ret_48",
+
+    "body_ratio",
+    "signed_body",
+    "upper_wick_ratio",
+    "lower_wick_ratio",
+
+    "atr_ratio",
+
+    "ema9_dist",
+    "ema21_dist",
+    "ema50_dist",
+
+    "ema9_slope",
+    "ema21_slope",
+    "ema50_slope",
+
+    "trend_strength",
+
+    "rsi",
+    "rsi_centered",
+
+    "momentum_3",
+    "momentum_6",
+    "momentum_12",
+
+    "range_pos_6",
+    "range_pos_12",
+    "range_pos_24",
+    "range_pos_48",
+
+    "hour_sin",
+    "hour_cos",
+
+    "session_asia",
+    "session_europe",
+    "session_newyork",
+    "session_evening",
+]
+
+assert len(FEATURES) == 34
+
+
+# ================================================================
+# TRAIN V19 MODEL
+# ================================================================
+
+print("\nDownloading EUR/USD training data...")
+
+data = download_data()
+
+print(f"Downloaded rows: {len(data):,}")
+
+features = build_features(data)
+
+# ------------------------------------------------------------
+# TARGET
+#
+# UP   = next close > current close
+# DOWN = next close < current close
+# TIE  = next close == current close
+# ------------------------------------------------------------
+
+next_close = data["close"].shift(-1)
+
+features["target"] = np.where(
+    next_close > data["close"],
+    1,
+    np.where(
+        next_close < data["close"],
+        0,
+        np.nan
+    )
+)
+
+# Target endpoint = next candle timestamp
+features["target_end"] = pd.Series(
+    data.index.to_series().shift(-1),
+    index=data.index
+)
+
+# ------------------------------------------------------------
+# MODEL READY
+# ------------------------------------------------------------
+
+model_df = features[
+    FEATURES +
+    ["target", "target_end"]
+].copy()
+
+model_df = model_df.dropna(subset=FEATURES + ["target", "target_end"])
+
+model_df["target"] = model_df["target"].astype(int)
+
+# Only binary UP/DOWN rows
+model_df = model_df[
+    model_df["target"].isin([0, 1])
+].copy()
+
+# ------------------------------------------------------------
+# CHRONOLOGICAL HOLDOUT
+# ------------------------------------------------------------
+
+split_idx = int(
+    len(model_df) * (1 - TRAIN_HOLDOUT)
+)
+
+holdout_start = model_df.index[split_idx]
+
+# TRUE PURGE:
+# Training labels must finish BEFORE holdout begins.
+train_df = model_df[
+    model_df["target_end"] < holdout_start
+].copy()
+
+print(f"Model-ready rows: {len(model_df):,}")
+print(f"Training rows:    {len(train_df):,}")
+print(f"Holdout start:    {holdout_start}")
+
+# ------------------------------------------------------------
+# FROZEN V19 MODEL
+# ------------------------------------------------------------
+
+model = Pipeline([
+    (
+        "scaler",
+        StandardScaler()
+    ),
+    (
+        "classifier",
+        LogisticRegression(
+            C=0.10,
+            max_iter=3000,
+            solver="lbfgs",
+            random_state=42
+        )
+    )
+])
+
+model.fit(
+    train_df[FEATURES],
+    train_df["target"]
+)
+
+print("NOVA V19 model loaded/trained.")
+
+
+# ================================================================
+# CSV HELPERS
+# ================================================================
+
+def load_csv(path, columns):
+
+    if os.path.exists(path):
+
+        try:
+            df = pd.read_csv(path)
+
+            for c in columns:
+                if c not in df.columns:
+                    df[c] = ""
+
+            return df
+
+        except Exception:
+            pass
+
+    return pd.DataFrame(columns=columns)
+
+
+SIGNAL_COLUMNS = [
+    "signal_id",
+    "candle_time_utc",
+    "candle_time_local",
+    "price",
+    "p_up",
+    "p_down",
+    "signal",
+    "expiry_time_utc",
+    "expiry_time_local",
+]
+
+TRADE_COLUMNS = [
+    "trade_id",
+    "signal_time_utc",
+    "signal_time_local",
+    "entry_time_utc",
+    "entry_time_local",
+    "entry_price",
+    "p_up",
+    "signal",
+    "expiry_time_utc",
+    "expiry_time_local",
+    "expiry_price",
+    "result",
+    "demo_return",
+    "notes",
+]
+
+signals_df = load_csv(
+    SIGNAL_LOG_FILE,
+    SIGNAL_COLUMNS
+)
+
+trades_df = load_csv(
+    TRADE_LOG_FILE,
+    TRADE_COLUMNS
+)
+
+
+# ================================================================
+# LIVE CLOCK
+# ================================================================
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
+def now_local():
+    return datetime.now(LOCAL_TZ)
+
+
+def fmt_local(dt):
+    return dt.astimezone(LOCAL_TZ).strftime(
+        "%Y-%m-%d %I:%M:%S %p %Z"
+    )
+
+
+def fmt_utc(dt):
+    return dt.astimezone(timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
+
+
+# ================================================================
+# GET LATEST COMPLETED CANDLE
+# ================================================================
+
+def get_latest_signal():
+
+    df = download_data()
+
+    feat = build_features(df)
+
+    # ------------------------------------------------------------
+    # IMPORTANT:
+    #
+    # Yahoo can contain the currently-forming candle.
+    # We use the SECOND-TO-LAST candle as the latest
+    # completed candle.
+    # ------------------------------------------------------------
+
+    if len(feat) < 3:
+        raise RuntimeError(
+            "Not enough candles returned."
+        )
+
+    completed_time = feat.index[-2]
+
+    row = feat.loc[completed_time]
+
+    # ------------------------------------------------------------
+    # Verify features
+    # ------------------------------------------------------------
+
+    if row[FEATURES].isna().any():
+
+        missing = row[FEATURES].index[
+            row[FEATURES].isna()
+        ].tolist()
+
+        raise RuntimeError(
+            f"Latest candle has missing features: {missing}"
+        )
+
+    X = pd.DataFrame(
+        [row[FEATURES].values],
+        columns=FEATURES
+    )
+
+    probabilities = model.predict_proba(X)[0]
+
+    classes = model.classes_
+
+    p_down = float(
+        probabilities[
+            list(classes).index(0)
+        ]
+    )
+
+    p_up = float(
+        probabilities[
+            list(classes).index(1)
+        ]
+    )
+
+    # ------------------------------------------------------------
+    # V19 SIGNAL LOGIC
+    # ------------------------------------------------------------
+
+    if p_up >= SIGNAL_THRESHOLD:
+
+        signal = "CALL"
+
+    elif p_down >= SIGNAL_THRESHOLD:
+
+        signal = "PUT"
+
+    else:
+
+        signal = "WAIT"
+
+    # ------------------------------------------------------------
+    # Expiry = next 5-minute candle
+    # ------------------------------------------------------------
+
+    expiry_time = completed_time + timedelta(
+        minutes=5
+    )
+
+    return {
+        "candle_time": completed_time,
+        "price": float(df.loc[completed_time, "close"]),
+        "p_up": p_up,
+        "p_down": p_down,
+        "signal": signal,
+        "expiry_time": expiry_time,
+    }
+
+
+# ================================================================
+# LOG SIGNAL
+# ================================================================
+
+def log_signal(sig):
+
+    global signals_df
+
+    candle_time = sig["candle_time"]
+
+    # Prevent duplicate signal rows
+    if len(signals_df) > 0:
+
+        existing = pd.to_datetime(
+            signals_df["candle_time_utc"],
+            errors="coerce",
+            utc=True
+        )
+
+        if candle_time in set(existing.dropna()):
+            return False
+
+    signal_id = (
+        datetime.now(timezone.utc).strftime(
+            "%Y%m%d%H%M%S"
+        )
+    )
+
+    new_row = {
+        "signal_id": signal_id,
+        "candle_time_utc": fmt_utc(candle_time),
+        "candle_time_local": fmt_local(candle_time),
+        "price": sig["price"],
+        "p_up": sig["p_up"],
+        "p_down": sig["p_down"],
+        "signal": sig["signal"],
+        "expiry_time_utc": fmt_utc(
+            sig["expiry_time"]
+        ),
+        "expiry_time_local": fmt_local(
+            sig["expiry_time"]
+        ),
+    }
+
+    signals_df = pd.concat(
+        [
+            signals_df,
+            pd.DataFrame([new_row])
+        ],
+        ignore_index=True
+    )
+
+    signals_df.to_csv(
+        SIGNAL_LOG_FILE,
+        index=False
+    )
+
+    return True
+
+
+# ================================================================
+# PERFORMANCE
+# ================================================================
+
+def show_performance():
+
+    print("\n" + "=" * 72)
+    print("DEMO PERFORMANCE")
+    print("=" * 72)
+
+    if len(trades_df) == 0:
+
+        print("No completed demo trades yet.")
+        return
+
+    results = trades_df["result"].astype(str).str.upper()
+
+    wins = (results == "WIN").sum()
+    losses = (results == "LOSS").sum()
+    pushes = (results == "PUSH").sum()
+
+    settled = wins + losses
+
+    if settled > 0:
+        win_rate = wins / settled * 100
+    else:
+        win_rate = 0
+
+    net_return = pd.to_numeric(
+        trades_df["demo_return"],
+        errors="coerce"
+    ).fillna(0).sum()
+
+    print(f"Trades:       {len(trades_df)}")
+    print(f"Wins:         {wins}")
+    print(f"Losses:       {losses}")
+    print(f"Pushes:       {pushes}")
+    print(f"Win rate:     {win_rate:.2f}%")
+    print(f"Break-even:   {100/(1+PAYOUT):.2f}%")
+    print(f"Net return:   {net_return:.2f} units")
+
+    # ------------------------------------------------------------
+    # CALL
+    # ------------------------------------------------------------
+
+    call = trades_df[
+        trades_df["signal"].astype(str).str.upper() == "CALL"
+    ]
+
+    if len(call) > 0:
+
+        cw = (
+            call["result"]
+            .astype(str)
+            .str.upper()
+            .eq("WIN")
+            .sum()
+        )
+
+        cl = (
+            call["result"]
+            .astype(str)
+            .str.upper()
+            .eq("LOSS")
+            .sum()
+        )
+
+        cs = cw + cl
+
+        print(
+            f"CALL:         {len(call)} trades | "
+            f"{cw}W / {cl}L | "
+            f"{(cw/cs*100 if cs else 0):.2f}%"
+        )
+
+    # ------------------------------------------------------------
+    # PUT
+    # ------------------------------------------------------------
+
+    put = trades_df[
+        trades_df["signal"].astype(str).str.upper() == "PUT"
+    ]
+
+    if len(put) > 0:
+
+        pw = (
+            put["result"]
+            .astype(str)
+            .str.upper()
+            .eq("WIN")
+            .sum()
+        )
+
+        pl = (
+            put["result"]
+            .astype(str)
+            .str.upper()
+            .eq("LOSS")
+            .sum()
+        )
+
+        ps = pw + pl
+
+        print(
+            f"PUT:          {len(put)} trades | "
+            f"{pw}W / {pl}L | "
+            f"{(pw/ps*100 if ps else 0):.2f}%"
+        )
+
+    print("=" * 72)
+
+
+# ================================================================
+# RECORD TRADE
+# ================================================================
+
+def record_trade():
+
+    global trades_df
+
+    print("\n" + "=" * 72)
+    print("RECORD DEMO TRADE")
+    print("=" * 72)
+
+    print("\nRecent signals:")
+
+    if len(signals_df) > 0:
+
+        print(
+            signals_df.tail(5)[
+                [
+                    "candle_time_local",
+                    "price",
+                    "p_up",
+                    "signal",
+                    "expiry_time_local"
+                ]
+            ].to_string(index=False)
+        )
+
+    print()
+
+    signal_time = input(
+        "Signal candle time UTC: "
+    ).strip()
+
+    entry_time = input(
+        "Entry time UTC: "
+    ).strip()
+
+    entry_price = float(
+        input("Pocket Option entry price: ")
+    )
+
+    p_up = float(
+        input("NOVA P(UP) as decimal (e.g. 0.63): ")
+    )
+
+    signal = input(
+        "Signal (CALL/PUT): "
+    ).strip().upper()
+
+    expiry_time = input(
+        "Expiry time UTC: "
+    ).strip()
+
+    expiry_price = float(
+        input("Pocket Option expiry price: ")
+    )
+
+    result = input(
+        "Result (WIN/LOSS/PUSH): "
+    ).strip().upper()
+
+    notes = input(
+        "Notes (optional): "
+    ).strip()
+
+    if result == "WIN":
+        demo_return = PAYOUT
+
+    elif result == "LOSS":
+        demo_return = -1.0
+
+    elif result == "PUSH":
+        demo_return = 0.0
+
+    else:
+        print("Invalid result.")
+        return
+
+    trade_id = datetime.now(
+        timezone.utc
+    ).strftime("%Y%m%d%H%M%S%f")
+
+    # Try to convert times
+    try:
+        st = pd.Timestamp(
+            signal_time,
+            tz="UTC"
+        ).to_pydatetime()
+
+        et = pd.Timestamp(
+            entry_time,
+            tz="UTC"
+        ).to_pydatetime()
+
+        xt = pd.Timestamp(
+            expiry_time,
+            tz="UTC"
+        ).to_pydatetime()
+
+        signal_local = fmt_local(st)
+        entry_local = fmt_local(et)
+        expiry_local = fmt_local(xt)
+
+    except Exception:
+
+        signal_local = ""
+        entry_local = ""
+        expiry_local = ""
+
+    new_trade = {
+        "trade_id": trade_id,
+
+        "signal_time_utc": signal_time,
+        "signal_time_local": signal_local,
+
+        "entry_time_utc": entry_time,
+        "entry_time_local": entry_local,
+
+        "entry_price": entry_price,
+
+        "p_up": p_up,
+
+        "signal": signal,
+
+        "expiry_time_utc": expiry_time,
+        "expiry_time_local": expiry_local,
+
+        "expiry_price": expiry_price,
+
+        "result": result,
+
+        "demo_return": demo_return,
+
+        "notes": notes,
+    }
+
+    trades_df = pd.concat(
+        [
+            trades_df,
+            pd.DataFrame([new_trade])
+        ],
+        ignore_index=True
+    )
+
+    trades_df.to_csv(
+        TRADE_LOG_FILE,
+        index=False
+    )
+
+    print("\nTrade saved.")
+    show_performance()
+
+
+# ================================================================
+# RECENT SIGNALS
+# ================================================================
+
+def show_recent_signals():
+
+    print("\n" + "=" * 72)
+    print("RECENT NOVA V19 SIGNALS")
+    print("=" * 72)
+
+    if len(signals_df) == 0:
+
+        print("No signals logged yet.")
+        return
+
+    cols = [
+        "candle_time_local",
+        "price",
+        "p_up",
+        "p_down",
+        "signal",
+        "expiry_time_local"
+    ]
+
+    print(
+        signals_df.tail(20)[cols].to_string(
+            index=False
+        )
+    )
+
+
+# ================================================================
+# MONITOR
+# ================================================================
+
+def run_monitor():
+
+    print("\nStarting live NOVA V19 monitor...")
+    print("The clock updates every second.")
+    print("NOVA checks for a new completed 5-minute candle.")
+    print("Press Ctrl+C to stop.\n")
+
+    last_processed_candle = None
+
+    while True:
+
+        try:
+
+            # ----------------------------------------------------
+            # REAL-TIME CLOCK
+            # ----------------------------------------------------
+
+            current_utc = now_utc()
+            current_local = now_local()
+
+            # ----------------------------------------------------
+            # GET LATEST SIGNAL
+            # ----------------------------------------------------
+
+            sig = get_latest_signal()
+
+            candle_time = sig["candle_time"]
+
+            # ----------------------------------------------------
+            # Only log / announce NEW candles
+            # ----------------------------------------------------
+
+            is_new = (
+                last_processed_candle is None
+                or candle_time != last_processed_candle
+            )
+
+            if is_new:
+
+                last_processed_candle = candle_time
+
+                log_signal(sig)
+
+            # ----------------------------------------------------
+            # DISPLAY
+            # ----------------------------------------------------
+
+            clear_output(wait=True)
+
+            print("=" * 72)
+            print("NOVA V19 — POCKET OPTION DEMO")
+            print("=" * 72)
+
+            print(
+                f"Live clock:   "
+                f"{current_local.strftime('%Y-%m-%d %I:%M:%S %p %Z')}"
+            )
+
+            print(
+                f"UTC clock:    "
+                f"{current_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}"
+            )
+
+            print("-" * 72)
+
+            print(
+                f"Candle:       {fmt_local(candle_time)}"
+            )
+
+            print(
+                f"Candle UTC:   {fmt_utc(candle_time)}"
+            )
+
+            print(
+                f"Price:        {sig['price']:.6f}"
+            )
+
+            print(
+                f"P(UP):        {sig['p_up']*100:.2f}%"
+            )
+
+            print(
+                f"P(DOWN):      {sig['p_down']*100:.2f}%"
+            )
+
+            print(
+                f"Signal:       {sig['signal']}"
+            )
+
+            print(
+                f"Expiry:       {fmt_local(sig['expiry_time'])}"
+            )
+
+            print(
+                f"Expiry UTC:   {fmt_utc(sig['expiry_time'])}"
+            )
+
+            print("=" * 72)
+
+            if sig["signal"] == "CALL":
+
+                print("\n>>> CALL SIGNAL <<<")
+
+            elif sig["signal"] == "PUT":
+
+                print("\n>>> PUT SIGNAL <<<")
+
+            else:
+
+                print("\n>>> WAIT / NO TRADE <<<")
+
+            print("\nPocket Option execution: MANUAL")
+            print("DEMO ACCOUNT ONLY — NO AUTOMATIC ORDER PLACEMENT")
+
+            show_performance()
+
+            print("\n" + "=" * 72)
+            print(
+                f"Next data check in {REFRESH_SECONDS} seconds..."
+            )
+            print(
+                "A new signal is generated only after a new "
+                "completed 5-minute candle appears."
+            )
+            print("=" * 72)
+
+            time.sleep(REFRESH_SECONDS)
+
+        except KeyboardInterrupt:
+
+            clear_output(wait=True)
+
+            print("=" * 72)
+            print("NOVA V19 MONITOR STOPPED")
+            print("=" * 72)
+
+            break
+
+        except Exception as e:
+
+            clear_output(wait=True)
+
+            print("=" * 72)
+            print("NOVA V19 — TEMPORARY DATA ERROR")
+            print("=" * 72)
+
+            print(
+                f"Live clock: {now_local().strftime('%Y-%m-%d %I:%M:%S %p %Z')}"
+            )
+
+            print(f"\nError: {e}")
+
+            print(
+                f"\nRetrying in {REFRESH_SECONDS} seconds..."
+            )
+
+            time.sleep(REFRESH_SECONDS)
+
+
+# ================================================================
+# MENU
+# ================================================================
+
+def main_menu():
+
+    while True:
+
+        print("\n" + "=" * 72)
+        print("NOVA V19 — DEMO MENU")
+        print("=" * 72)
+
+        print("1 — Start live signal monitor")
+        print("2 — Record completed demo trade")
+        print("3 — Show performance")
+        print("4 — Show recent signals")
+        print("5 — Exit")
+
+        choice = input("\nChoose: ").strip()
+
+        if choice == "1":
+
+            run_monitor()
+
+        elif choice == "2":
+
+            record_trade()
+
+        elif choice == "3":
+
+            show_performance()
+
+        elif choice == "4":
+
+            show_recent_signals()
+
+        elif choice == "5":
+
+            print("\nNOVA V19 tracker closed.")
+            break
+
+        else:
+
+            print("Invalid choice.")
+
+
+# ================================================================
+# START
+# ================================================================
+
+main_menu()
